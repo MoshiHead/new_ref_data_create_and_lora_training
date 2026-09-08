@@ -29,8 +29,9 @@ a voice assistant, phrased as if the fact is current / recent (use words like "r
 "currently", "latest" where natural). Keep it short, one sentence, natural spoken English. Do not \
 just copy the source question verbatim if it reads like a written exam question.
 
-"ref_fact": Compress the source answer into ONE short sentence stating the specific fact (the number, \
-name, date, or figure) that answers the question, written so it can be read aloud.
+"ref_fact": Compress the source answer into ONE short sentence (20 words or fewer) stating the specific \
+fact (the number, name, date, or figure) that answers the question, written so it can be read aloud. \
+Do not summarize the whole source passage -- state only the one fact the question asked for.
 Rules for this field:
 {plain_text_rules}- Never mention "the passage", "the document", "the context", or any source -- state \
 the fact directly as if it is simply known.
@@ -46,12 +47,22 @@ those are internal system tags and must never appear in spoken text.
 - The reply must actually state the specific fact from "ref_fact" (the same number/name/date), just \
 phrased conversationally -- do not vaguely gesture at it without saying it.
 
-Respond with only the JSON object: {{"spoken_question": "...", "ref_fact": "...", "spoken_answer": "..."}}"""
+CRITICAL FORMATTING RULE: this must be valid JSON. ALL THREE field values must be wrapped in double \
+quotes -- including "ref_fact" and "spoken_answer", not just "spoken_question". If a value itself \
+contains a double quote, escape it as \\". Do not add line breaks inside a value. Do not write anything \
+before or after the JSON object -- no preamble, no closing remarks.
+
+Example of the exact shape required (write your own content, keep this structure):
+{{"spoken_question": "How is Apple's revenue looking this quarter?", "ref_fact": "Apple reported quarterly revenue of $94.9 billion.", "spoken_answer": "Apple brought in about ninety four point nine billion dollars in revenue this quarter."}}
+
+Respond with only the JSON object, matching that shape exactly."""
+
+EXPECTED_FIELDS = ["spoken_question", "ref_fact", "spoken_answer"]
 
 
 def build_conversion_prompt(question: str, answer: str, context: str = "") -> tuple[str, str]:
     """Returns (system_prompt, user_prompt) for one QA-row -> episode conversion call."""
-    context_block = f"Source context excerpt: {context.strip()[:800]}\n" if context and context.strip() else ""
+    context_block = f"Source context excerpt: {context.strip()[:500]}\n" if context and context.strip() else ""
     user = CONVERSION_USER_TEMPLATE.format(
         question=question.strip(),
         answer=answer.strip(),

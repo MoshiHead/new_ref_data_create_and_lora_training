@@ -18,16 +18,21 @@ from typing import Optional
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def _extract_json(text: str) -> Optional[dict]:
-    """Best-effort JSON extraction: strips ```json fences if present, then
-    falls back to grabbing the largest {...} span. Returns None on failure
-    rather than raising, so the caller can retry or skip the row."""
-    if not text:
-        return None
-    cleaned = text.strip()
+def _strip_code_fences(text: str) -> str:
+    cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
         cleaned = re.sub(r"```\s*$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_json(cleaned: str) -> Optional[dict]:
+    """Best-effort JSON extraction from already-fence-stripped text: tries a
+    direct parse, then falls back to grabbing the largest {...} span. Returns
+    None on failure rather than raising, so the caller can retry or fall back
+    to `_extract_fields_lenient`."""
+    if not cleaned:
+        return None
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
@@ -41,13 +46,51 @@ def _extract_json(text: str) -> Optional[dict]:
         return None
 
 
+def _extract_fields_lenient(text: str, fields: list[str]) -> Optional[dict]:
+    """Fallback used when the model's output isn't valid JSON at all --
+    observed in practice from the smaller/quantized local generator model
+    forgetting to wrap one field's value in quotes (e.g. producing
+    `"ref_fact": The company reported ...` instead of `"ref_fact": "The
+    company reported ..."`), which breaks `json.loads` even though every
+    field is still present and in order.
+
+    Finds each expected field by name (in the order given) and takes
+    everything between it and the start of the next expected field (or the
+    end of the text, for the last one) as that field's value -- no strict
+    JSON syntax required. `fields` must be given in the same order the
+    prompt asked the model to produce them in."""
+    if not text or not fields:
+        return None
+    result: dict[str, str] = {}
+    for i, field in enumerate(fields):
+        m_start = re.search(rf'"{re.escape(field)}"\s*:\s*"?', text)
+        if not m_start:
+            return None
+        value_start = m_start.end()
+        end_pos = len(text)
+        for other in fields[i + 1:]:
+            m_next = re.search(rf'"{re.escape(other)}"\s*:', text[value_start:])
+            if m_next:
+                end_pos = value_start + m_next.start()
+                break
+        raw_value = text[value_start:end_pos]
+        # Strip trailing JSON furniture a truncated/malformed blob leaves
+        # behind: an optional closing quote, comma, closing brace, whitespace.
+        raw_value = re.sub(r'"?\s*,?\s*\}?\s*$', "", raw_value.rstrip())
+        value = raw_value.strip().replace('\\"', '"').replace("\\n", " ").replace("\\'", "'")
+        if not value:
+            return None
+        result[field] = value
+    return result
+
+
 @dataclass
 class BackendConfig:
     local_model_id: str = "Qwen/Qwen2.5-14B-Instruct"
     local_device: str = "cuda"
     local_4bit: bool = True
     temperature: float = 0.4
-    max_tokens: int = 400
+    max_tokens: int = 600
 
 
 class LLMGenerator:
@@ -136,7 +179,14 @@ class LLMGenerator:
             )
         return self._tokenizer.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-    def generate_json(self, system_prompt: str, user_prompt: str, retries: int = 2) -> Optional[dict]:
+    def generate_json(
+        self, system_prompt: str, user_prompt: str, retries: int = 2,
+        expected_fields: Optional[list[str]] = None,
+    ) -> Optional[dict]:
+        """`expected_fields`, if given, is tried as a lenient name-based
+        fallback (see `_extract_fields_lenient`) whenever strict JSON parsing
+        fails -- pass the field names in the same order the prompt asked for
+        them."""
         last_err = None
         for attempt in range(retries + 1):
             try:
@@ -152,9 +202,12 @@ class LLMGenerator:
                 last_err = e
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            parsed = _extract_json(raw)
+            cleaned = _strip_code_fences(raw)
+            parsed = _extract_json(cleaned)
+            if parsed is None and expected_fields:
+                parsed = _extract_fields_lenient(cleaned, expected_fields)
             if parsed is not None:
                 return parsed
-            last_err = ValueError(f"could not parse JSON from model output: {raw[:200]!r}")
+            last_err = ValueError(f"could not parse JSON from model output: {raw[:300]!r}")
         print(f"[llm_backends] giving up after {retries + 1} attempts: {last_err!r}", flush=True)
         return None

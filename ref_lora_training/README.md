@@ -73,8 +73,13 @@ ref_lora_training/
                           used to build the scope-negative examples
     generation_prompts.py the prompt sent to the conversion LLM
     llm_backends.py       loads a local instruct model (Qwen2.5-14B-Instruct
-                          by default) on the pod's GPU and calls it -- no
-                          external API
+                          by default) and calls it -- no external API. Also
+                          has the lenient JSON fallback parser (see below)
+    generation_worker.py  standalone single-GPU worker process (one QA-row
+                          shard in, one JSONL of episodes out) -- launched as
+                          a subprocess, one per GPU
+    multi_gpu_runner.py   shards QA rows across every visible GPU and runs
+                          one generation_worker.py per GPU in parallel
     dataset_builder.py    QA rows -> episodes -> validated JSONL
     model_adapter.py      loads PersonaPlex like liveTry.py does, attaches
                           peft LoRA, and the training forward/loss -- READ
@@ -106,6 +111,19 @@ catch this: one real forward+backward pass, on your actual RunPod GPU,
 against your actual installed `moshi` package, before any real training
 starts. If it fails, the fix is entirely contained to the `_FORWARD_ATTEMPTS`
 list at the top of `model_adapter.py` -- nothing else needs to change.
+
+## Multi-GPU dataset generation
+
+Notebook 1's conversion step (Section 4) auto-detects every GPU visible to
+the pod (`N_GPUS = None` in the config cell) and launches one worker
+subprocess per GPU via `common/multi_gpu_runner.py`, each loading its own
+full copy of the local model and working through its own slice of the QA
+rows. This is data parallelism, not model parallelism -- the right choice
+for many independent, short generations -- so with N GPUs you get roughly an
+N x speedup and every GPU should show ~100% utilization in `nvidia-smi`
+while it runs. Each worker's output streams live into the notebook cell,
+prefixed `[gpu 0]`, `[gpu 1]`, etc. Set `N_GPUS` to an int to cap how many
+GPUs are used instead of using all of them.
 
 ## Design choices worth knowing about
 

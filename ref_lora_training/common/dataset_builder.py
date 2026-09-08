@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .distractors import DISTRACTOR_TURNS
-from .generation_prompts import build_conversion_prompt
+from .generation_prompts import build_conversion_prompt, EXPECTED_FIELDS
 from .llm_backends import LLMGenerator
 from .ref_format import (
     Episode, ExampleType, Turn, NO_CONTEXT_FALLBACK_FACT, validate_episode,
@@ -57,7 +57,7 @@ def generate_grounded_episode(
     row: dict, idx: int, generator: LLMGenerator, system_prompt: str, source_tag: str,
 ) -> Optional[Episode]:
     system_p, user_p = build_conversion_prompt(row["question"], row["answer"], row.get("context", ""))
-    parsed = generator.generate_json(system_p, user_p)
+    parsed = generator.generate_json(system_p, user_p, expected_fields=EXPECTED_FIELDS)
     if not parsed:
         return None
     spoken_q = str(parsed.get("spoken_question", "")).strip()
