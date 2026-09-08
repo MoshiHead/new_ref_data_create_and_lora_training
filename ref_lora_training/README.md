@@ -53,9 +53,13 @@ launch run_imtalker_personaplex.sh with ENABLE_SEARCH=1
 Run both notebooks on RunPod. Notebook 1 loads a local instruct model
 (default `Qwen/Qwen2.5-14B-Instruct`, 4-bit) on the pod's own GPU to do the
 conversion -- no external API, no API key, nothing leaves the pod. Notebook 2
-needs a GPU capable of loading the PersonaPlex 7B model (4-bit) plus LoRA
-training overhead -- an RTX 4090/5090 or A100/L40S-class pod is comfortable
-for both.
+downloads everything it needs itself (PersonaPlex's 4-bit weights and its
+bundled `moshi` source -- just the pieces training needs, not the full
+avatar/renderer/voice stack `prepare_imtalker_personaplex.sh` also fetches
+for the live server) and needs a GPU capable of loading the PersonaPlex 7B
+model (4-bit) plus LoRA training overhead -- an RTX 4090/5090 or A100/L40S-
+class pod is comfortable for both. Both notebooks use every GPU visible to
+the pod automatically.
 
 ## Folder layout
 
@@ -86,6 +90,12 @@ ref_lora_training/
                           THE MODULE DOCSTRING before trusting this file
     batching.py           episodes -> the codes/loss_mask tensors used to
                           train
+    train_worker.py       the actual training loop, run once per GPU under
+                          torchrun (DistributedDataParallel)
+    launch_training.py    builds and launches the torchrun command for
+                          train_worker.py across every visible GPU
+    proc_utils.py         shared subprocess-streaming helper used by both
+                          multi_gpu_runner.py and launch_training.py
   dataset_out/            01's output lands here (train.jsonl, val.jsonl,
                           raw_generated.jsonl)
   checkpoints_out/        02's output lands here
@@ -106,11 +116,15 @@ text), which is what PersonaPlex's own loader API is built on, but PersonaPlex
 is NVIDIA's own checkpoint/fork and its exact source could not be fetched or
 verified from the environment this was written in.
 
-`02_LoRA_Training.ipynb` Section 4 runs `run_contract_check()` specifically to
+`02_LoRA_Training.ipynb` Section 6 runs `run_contract_check()` specifically to
 catch this: one real forward+backward pass, on your actual RunPod GPU,
 against your actual installed `moshi` package, before any real training
 starts. If it fails, the fix is entirely contained to the `_FORWARD_ATTEMPTS`
-list at the top of `model_adapter.py` -- nothing else needs to change.
+list at the top of `model_adapter.py` -- nothing else needs to change. The
+full multi-GPU training run (Section 8) repeats this same check independently
+on every GPU it uses, since each one is a separate process with its own
+model copy; Section 6 is a fast single-GPU preview so a bad assumption is
+caught in seconds rather than after the multi-GPU launch spins up.
 
 ## Multi-GPU dataset generation
 
@@ -124,6 +138,23 @@ N x speedup and every GPU should show ~100% utilization in `nvidia-smi`
 while it runs. Each worker's output streams live into the notebook cell,
 prefixed `[gpu 0]`, `[gpu 1]`, etc. Set `N_GPUS` to an int to cap how many
 GPUs are used instead of using all of them.
+
+## Multi-GPU training
+
+Notebook 2's training step (Section 8) auto-detects every GPU visible to the
+pod and launches `common/train_worker.py` under `torchrun`
+(`common/launch_training.py`), one process per GPU. Each process loads its
+own full 4-bit copy of PersonaPlex plus its own LoRA, and gradients are
+averaged across every GPU each optimizer step via PyTorch
+`DistributedDataParallel` -- standard data-parallel training, which is what
+actually drives every GPU toward ~100% utilization and scales throughput
+with GPU count (as opposed to `device_map="auto"`-style model sharding,
+which only helps a model that doesn't fit on one GPU and doesn't speed up
+training). The training data is split evenly across ranks so every GPU runs
+the exact same number of optimizer steps per epoch, which DDP requires.
+Output from every rank streams live into the cell; only rank 0 saves
+checkpoints and prints the periodic loss/eval lines to keep the log
+readable.
 
 ## Design choices worth knowing about
 
@@ -149,6 +180,18 @@ GPUs are used instead of using all of them.
   the finance/crypto/investment persona in
   `IMTalker/prompts/Robert_8998_default.txt`. Swap `DATASET_HF_ID` and the
   three column names in notebook 1's config cell for any other QA dataset.
+- **`LORA_TARGET_MODULES` defaults to `["proj", "fc1", "out_proj", "fc2",
+  "linear", "in_proj"]`**, not auto-discovery -- these are the exact module
+  names from the *currently-deployed* reference LoRA's own
+  `adapter_config.json` (embedded in `prepare_imtalker_personaplex.sh`),
+  confirmed-correct for this exact architecture. Set it to `None` to fall
+  back to `common/model_adapter.discover_target_modules`'s heuristic instead.
+- **Gradient checkpointing is off by default** (`attach_lora`'s
+  `use_gradient_checkpointing=False`). peft's gradient-checkpointing setup
+  calls `transformers.PreTrainedModel`-only APIs
+  (`gradient_checkpointing_enable`, `get_input_embeddings`) that a raw
+  `moshi.models.lm.LMModel` doesn't implement -- turning it on would raise
+  before training starts unless your specific fork happens to expose that API.
 
 ## After training
 

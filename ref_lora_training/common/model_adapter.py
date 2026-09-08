@@ -148,6 +148,7 @@ def attach_lora(
     alpha: Optional[int] = None,
     dropout: float = 0.05,
     target_modules: Optional[list[str]] = None,
+    use_gradient_checkpointing: bool = False,
 ):
     """Wraps `lm` in a fresh trainable LoRA via peft.get_peft_model (NOT
     PeftModel.from_pretrained -- that call, used in liveTry.py, is for
@@ -155,10 +156,19 @@ def attach_lora(
     weights to train). peft handles bitsandbytes 4-bit base layers
     generically, and liveTry.py already proves this exact `lm` object is
     peft-compatible when loaded this way (it successfully wraps it with
-    `PeftModel.from_pretrained` for inference)."""
+    `PeftModel.from_pretrained` for inference).
+
+    `use_gradient_checkpointing` defaults to False on purpose: peft's
+    gradient-checkpointing setup (inside `prepare_model_for_kbit_training`)
+    calls `model.gradient_checkpointing_enable()` / `model.get_input_embeddings()`
+    unconditionally -- both are `transformers.PreTrainedModel` APIs that a raw
+    `moshi.models.lm.LMModel` does not implement, so turning this on would
+    raise an AttributeError before training even starts. Flip it on only if
+    you've confirmed your installed moshi fork's LMModel actually exposes
+    that API (check with `hasattr(lm, "gradient_checkpointing_enable")`)."""
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-    lm = prepare_model_for_kbit_training(lm, use_gradient_checkpointing=True)
+    lm = prepare_model_for_kbit_training(lm, use_gradient_checkpointing=use_gradient_checkpointing)
     if target_modules is None:
         target_modules = discover_target_modules(lm)
         print(f"[model_adapter] auto-detected target_modules: {target_modules}", flush=True)
