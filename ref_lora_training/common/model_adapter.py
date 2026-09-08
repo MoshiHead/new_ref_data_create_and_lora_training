@@ -264,6 +264,40 @@ def compute_text_loss(lm: torch.nn.Module, codes: torch.Tensor, loss_mask: torch
     )
 
 
+def resolve_vocab_size(tokenizer, default: int = 32000) -> int:
+    """Best-effort vocabulary size across tokenizer implementations.
+
+    A naive `getattr(tokenizer, "vocab_size", None) or
+    getattr(tokenizer, "get_piece_size", lambda: default)()` looks reasonable
+    but is wrong for a sentencepiece `SentencePieceProcessor` (the tokenizer
+    `load_base_model` actually returns for PersonaPlex): there, `vocab_size`
+    is a METHOD, not an int property. A bound method is truthy, so the `or`
+    short-circuits on the method object itself without ever calling it,
+    handing a method (not an int) to whatever expects a vocab size -- which
+    is exactly what raised `TypeError: '<' not supported between instances
+    of 'int' and 'method'` inside `run_contract_check`'s `min(vocab_size,
+    1000)`. This checks each candidate attribute and calls it only when it's
+    actually callable (mirrors the same pattern already used for this reason
+    in `search_helpers.describe_tokenizer`)."""
+    for attr in ("vocab_size", "get_piece_size", "__len__"):
+        try:
+            val = getattr(tokenizer, attr)
+        except AttributeError:
+            continue
+        try:
+            val = val() if callable(val) else val
+        except Exception:
+            continue
+        if isinstance(val, int) and val > 0:
+            return val
+    print(
+        f"[model_adapter] could not resolve a vocab size from the tokenizer "
+        f"(type={type(tokenizer).__name__}); defaulting to {default}",
+        flush=True,
+    )
+    return default
+
+
 def run_contract_check(lm: torch.nn.Module, num_codebooks: int, vocab_size: int, device: str = "cuda") -> str:
     """Builds a tiny synthetic batch and runs ONE forward+backward pass
     before real training starts. This is the single most important cell in

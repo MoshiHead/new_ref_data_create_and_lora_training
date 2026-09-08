@@ -86,7 +86,8 @@ def main() -> None:
     print(f"[train_worker rank {rank}] using device {device}", flush=True)
 
     from ref_lora_training.common.model_adapter import (
-        load_base_model, attach_lora, run_contract_check, compute_text_loss, save_adapter,
+        load_base_model, attach_lora, run_contract_check, resolve_vocab_size,
+        compute_text_loss, save_adapter,
     )
     from ref_lora_training.common.dataset_builder import read_jsonl
     from ref_lora_training.common.batching import tokenize_episode, resolve_text_pad_id, build_batch
@@ -105,10 +106,7 @@ def main() -> None:
         target_modules=target_modules,
     )
 
-    vocab_size_guess = (
-        getattr(tokenizer, "vocab_size", None)
-        or getattr(tokenizer, "get_piece_size", lambda: 32000)()
-    )
+    vocab_size_guess = resolve_vocab_size(tokenizer)
     # Every rank validates its OWN model instance independently -- cheap (one
     # forward+backward on a tiny synthetic batch), and if any rank's contract
     # check fails it raises in that process, which torchrun reports as a
