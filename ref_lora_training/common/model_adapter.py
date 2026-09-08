@@ -4,32 +4,33 @@ teacher-forcing forward/loss used to train it.
 
 READ THIS BEFORE TRUSTING IT BLINDLY
 =====================================
-`load_base_model()` and `load_ref_lora_for_inference_check()` are copied
+`load_base_model()` and `attach_lora()`'s model-loading half are copied
 line-for-line from the loading logic in IMTalker/liveTry.py (the file your
 production server actually runs). That part is guaranteed to match, because
 it IS the production code path.
 
-`compute_text_loss()` is NOT copied from anywhere -- production never trains
-this model, it only ever calls the streaming, no-grad `LMGen.step()` /
-`lm_gen._step()` inference API (see IMTalker/imtalker_personaplex_try_vad2_8998.py
-`_inject_tokens`). There is no training entry point in this repository to
-copy from. This function instead targets the standard training contract of
-the open-source Moshi `LMModel` class that PersonaPlex's own `loaders.py` is
-built on (`codes: [B, K, T]` int tensor, codebook 0 = text, forward returns
-per-codebook logits) -- the same contract Kyutai's own reference LoRA
-fine-tuning recipe for Moshi-family models trains against. Because
-PersonaPlex is NVIDIA's own checkpoint/fork and this analysis environment has
-no network access to fetch its bundled `moshi` source, that contract could
-not be verified against the real class before you run this on RunPod.
+`compute_text_loss()` calls `LMModel.forward_train(codes)` -- CONFIRMED
+against the real class by reading its actual source
+(`moshi/models/lm.py` inside the downloaded
+`brianmatzelle/personaplex-7b-v1-bnb-4bit` checkpoint) directly on a live
+RunPod pod, not guessed. `LMModel` has no plain `forward` at all (calling
+`lm(codes)` raises `NotImplementedError('Module [LMModel] is missing the
+required "forward" function')` -- production never calls it that way either;
+it only ever drives the model through the streaming, no-grad `LMGen.step()`
+inference API, see `IMTalker/imtalker_personaplex_try_vad2_8998.py`'s
+`_inject_tokens`). `forward_train` is the method whose name and signature
+(`codes: torch.Tensor` of shape `[B, K, T]`) make it unambiguously the
+training entry point, and its source shows it already handles the model's
+internal per-codebook delay pattern and realigns its output logits back to
+the SAME time indices as the input -- see `compute_text_loss`'s own
+docstring for what that means for how targets are computed here (no manual
+shift-by-one).
 
-That is exactly what `run_contract_check()` is for. It runs ONE forward+
-backward pass on a tiny synthetic batch, on your actual RunPod GPU, against
-your actual installed `moshi` package, before any real training happens, and
-prints exactly what it tried and what worked. If your fork's forward
-signature differs, this is where you'll see it fail with a clear message
-telling you which attempt was tried -- fix ONLY the `_FORWARD_ATTEMPTS` list
-below and re-run the contract check; nothing else in this file or in the
-training notebook needs to change.
+`run_contract_check()` still exists and still matters: it runs one real
+forward+backward pass on a tiny synthetic batch, on your actual GPU, before
+any real training time is spent, so a bad LoRA-target-module choice or a
+frozen-gradient bug is caught in seconds rather than after a training run
+appears to proceed but produces a useless adapter.
 """
 from __future__ import annotations
 
@@ -193,75 +194,103 @@ def attach_lora(
 # like [B, T, vocab] or [B, K, T, vocab] is used. Add your fork's real
 # calling convention to the TOP of this list if none of these match.
 
-def _get_text_logits(out, codes_text_codebook_index: int = 0):
-    """Normalizes a handful of plausible LMModel output shapes down to plain
-    [B, T, vocab] text logits."""
-    if hasattr(out, "text_logits") and out.text_logits is not None:
-        return out.text_logits
-    if hasattr(out, "logits"):
-        logits = out.logits
-        if logits.dim() == 4:  # [B, K, T, vocab] -- text is codebook 0
-            return logits[:, codes_text_codebook_index]
-        if logits.dim() == 3:  # already [B, T, vocab]
-            return logits
-    if torch.is_tensor(out):
-        if out.dim() == 4:
-            return out[:, codes_text_codebook_index]
-        if out.dim() == 3:
-            return out
-    raise TypeError(f"don't know how to extract text logits from output of type {type(out)}")
-
-
-_FORWARD_ATTEMPTS = [
-    ("lm(codes)", lambda lm, codes: lm(codes)),
-    ("lm(codes=codes)", lambda lm, codes: lm(codes=codes)),
-    ("lm(codes, condition_tensors=None)", lambda lm, codes: lm(codes, condition_tensors=None)),
-    ("lm.forward(codes)", lambda lm, codes: lm.forward(codes)),
-]
-
-
-def compute_text_loss(lm: torch.nn.Module, codes: torch.Tensor, loss_mask: torch.Tensor,
-                       forward_attempt_name: Optional[str] = None) -> tuple[torch.Tensor, str]:
-    """codes: [B, 1+n_audio, T] int64, codebook 0 = text, next-token target is
-    codes[:, 0, 1:]. loss_mask: [B, T-1] float/bool, 1 where that target
-    position should be supervised (assistant-speech tokens only -- everything
-    else, including the injected <ref> block itself, is context and must NOT
-    receive gradient, exactly like prompt-masking in ordinary causal-LM SFT).
-
-    Returns (loss, attempt_name_used). Pass `forward_attempt_name` once you
-    know which one works (from run_contract_check) to skip re-probing every
-    step."""
-    attempts = _FORWARD_ATTEMPTS
-    if forward_attempt_name is not None:
-        attempts = [a for a in _FORWARD_ATTEMPTS if a[0] == forward_attempt_name] or _FORWARD_ATTEMPTS
-
-    last_err = None
-    for name, fn in attempts:
-        try:
-            out = fn(lm, codes)
-            text_logits = _get_text_logits(out)  # [B, T, V]
-            targets = codes[:, 0, 1:]              # [B, T-1]
-            pred = text_logits[:, :-1, :]           # predict position t+1 from position t
-            vocab = pred.size(-1)
-            per_tok = F.cross_entropy(
-                pred.reshape(-1, vocab), targets.reshape(-1), reduction="none",
-            ).view_as(targets)
-            mask = loss_mask.to(per_tok.dtype)
-            denom = mask.sum().clamp_min(1.0)
-            loss = (per_tok * mask).sum() / denom
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"non-finite loss from attempt {name!r}")
-            return loss, name
-        except Exception as e:  # noqa: BLE001 - intentionally broad, we're probing
-            last_err = e
-            continue
-    raise RuntimeError(
-        "No forward-call convention in _FORWARD_ATTEMPTS worked against your installed "
-        f"moshi LMModel. Last error: {last_err!r}\n"
-        "Fix: inspect `inspect.signature(lm.forward)` and `type(lm).__mro__` in a scratch "
-        "cell, add the correct call as a new entry at the TOP of _FORWARD_ATTEMPTS in "
-        "ref_lora_training/common/model_adapter.py, and re-run run_contract_check()."
+def resolve_num_codebooks(lm: torch.nn.Module, fallback: int) -> int:
+    """`lm.num_codebooks` (K in the [B, K, T] codes tensor forward_train
+    expects: 1 text codebook + N audio codebooks) read directly off the
+    loaded model -- confirmed via source inspection
+    (`moshi/models/lm.py`'s `embed_codes`: `assert K == self.num_codebooks`).
+    peft's `PeftModel.__getattr__` delegates unknown attributes to the
+    wrapped base model, so this works whether `lm` is the raw LMModel or a
+    peft-wrapped one. Falls back to the caller's guess only if the attribute
+    is genuinely missing (e.g. a future fork that renames it)."""
+    val = getattr(lm, "num_codebooks", None)
+    if isinstance(val, int) and val > 0:
+        return val
+    print(
+        f"[model_adapter] lm.num_codebooks not found or not an int (got {val!r}); "
+        f"falling back to {fallback}. Verify this against your loaded model "
+        f"(`raw_lm.num_codebooks`) if training shapes look wrong.",
+        flush=True,
     )
+    return fallback
+
+
+def resolve_zero_token_id(lm: torch.nn.Module, fallback: int = 0) -> int:
+    """`lm.zero_token_id` -- the model's OWN sentinel for "no token here" on
+    the codes grid, used internally by `forward_train` to decide which
+    positions are valid (`codes[..] != self.zero_token_id`). This is the
+    correct fill value for the silent placeholder audio channels (see
+    batching.py's module docstring) and for text-side batch padding -- NOT
+    an arbitrary 0, and NOT the text tokenizer's own pad id (a different,
+    unrelated concept: that's about the SentencePiece vocabulary, this is
+    about the multistream codes grid)."""
+    val = getattr(lm, "zero_token_id", None)
+    if isinstance(val, int):
+        return val
+    print(
+        f"[model_adapter] lm.zero_token_id not found (got {val!r}); defaulting to {fallback}.",
+        flush=True,
+    )
+    return fallback
+
+
+def compute_text_loss(
+    lm: torch.nn.Module, codes: torch.Tensor, loss_mask: torch.Tensor,
+    forward_attempt_name: Optional[str] = None,
+) -> tuple[torch.Tensor, str]:
+    """codes: [B, K, T] int64, K = lm.num_codebooks, codebook 0 = text.
+    loss_mask: [B, T] float/bool, 1 where codes[:, 0, t] should be supervised
+    (assistant-speech tokens only -- everything else, including the injected
+    <ref> block itself, is context and must NOT receive gradient, exactly
+    like prompt-masking in ordinary causal-LM SFT).
+
+    Calls the confirmed-correct training entry point,
+    `LMModel.forward_train(codes)` (found by reading
+    moshi/models/lm.py directly -- `LMModel` has no plain `forward`, so
+    `lm(codes)` always raised `NotImplementedError`). `forward_train` already
+    handles the model's internal delay pattern and prepends its own initial
+    token before computing logits, then re-aligns (`_undelay_sequence`) the
+    result back to the SAME time indices as the input `codes` -- so
+    `text_logits[:, t]` is already the (causally correct) prediction FOR
+    `codes[:, 0, t]` itself. No additional manual shift-by-one belongs here;
+    an earlier version of this function applied one on top, which would have
+    silently trained against off-by-one targets.
+
+    `forward_train` deliberately fills logits at delay-invalid positions with
+    NaN (confirmed in its source) and returns a companion `text_logits_mask`
+    marking which positions are real. Both `loss_mask` (your supervision
+    mask) and that validity mask are combined, and the NaN entries are
+    zeroed out before the cross-entropy call -- multiplying a NaN by a 0 mask
+    does NOT produce 0, it produces NaN, so this must happen before, not
+    after, the loss is computed."""
+    out = lm.forward_train(codes)
+    text_logits = getattr(out, "text_logits", None)
+    if text_logits is None:
+        text_logits = out[2]  # LMOutput(logits, logits_mask, text_logits, text_logits_mask)
+    text_logits = text_logits[:, 0]  # [B, 1, T, V] -> [B, T, V]
+
+    valid_mask = getattr(out, "text_logits_mask", None)
+    if valid_mask is None:
+        valid_mask = out[3]
+    valid_mask = valid_mask[:, 0].to(loss_mask.dtype)  # [B, 1, T] -> [B, T]
+
+    targets = codes[:, 0, :]  # [B, T] -- direct correspondence, see docstring
+    combined_mask = loss_mask.to(text_logits.dtype) * valid_mask.to(text_logits.dtype)
+
+    safe_logits = torch.nan_to_num(text_logits, nan=0.0)
+    vocab = safe_logits.size(-1)
+    per_tok = F.cross_entropy(
+        safe_logits.reshape(-1, vocab), targets.reshape(-1).long(), reduction="none",
+    ).view_as(targets)
+    denom = combined_mask.sum().clamp_min(1.0)
+    loss = (per_tok * combined_mask).sum() / denom
+    if not torch.isfinite(loss):
+        raise RuntimeError(
+            "compute_text_loss produced a non-finite loss even after NaN-safe masking -- "
+            "check that `loss_mask` actually has at least one supervised position with a "
+            "delay-valid target (combined_mask.sum() might be 0)."
+        )
+    return loss, "forward_train"
 
 
 def resolve_vocab_size(tokenizer, default: int = 32000) -> int:
@@ -298,14 +327,27 @@ def resolve_vocab_size(tokenizer, default: int = 32000) -> int:
     return default
 
 
-def run_contract_check(lm: torch.nn.Module, num_codebooks: int, vocab_size: int, device: str = "cuda") -> str:
+def run_contract_check(lm: torch.nn.Module, vocab_size: int, device: str = "cuda",
+                        num_codebooks: Optional[int] = None) -> str:
     """Builds a tiny synthetic batch and runs ONE forward+backward pass
     before real training starts. This is the single most important cell in
-    the training notebook -- do not skip it. Returns the forward-attempt name
-    that worked, to pass into compute_text_loss for every real step."""
+    the training notebook -- do not skip it.
+
+    `num_codebooks` is only a fallback for `resolve_num_codebooks`; the real
+    value is read directly off `lm` when available (see its docstring), so
+    passing nothing is normally fine and safer than hardcoding a guess here.
+
+    Values are drawn from a tiny range (1-3), not `vocab_size` -- this is a
+    synthetic smoke test that only needs to exercise every codebook's
+    embedding lookup and the loss computation without going out of bounds of
+    whichever cardinality that particular codebook actually has (text and
+    audio codebooks generally have different vocab sizes); it deliberately
+    avoids 0 in case that collides with the model's own zero_token_id
+    sentinel, which would trivially zero out the whole loss mask."""
+    K = resolve_num_codebooks(lm, fallback=(1 + num_codebooks) if num_codebooks else 9)
     B, T = 2, 16
-    codes = torch.randint(0, min(vocab_size, 1000), (B, 1 + num_codebooks, T), device=device)
-    loss_mask = torch.ones(B, T - 1, device=device)
+    codes = torch.randint(1, 4, (B, K, T), device=device)
+    loss_mask = torch.ones(B, T, device=device)
     loss_mask[:, : T // 2] = 0.0  # exercise the masking path, not just "supervise everything"
 
     trainable = [p for p in lm.parameters() if p.requires_grad]

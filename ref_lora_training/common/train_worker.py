@@ -87,10 +87,10 @@ def main() -> None:
 
     from ref_lora_training.common.model_adapter import (
         load_base_model, attach_lora, run_contract_check, resolve_vocab_size,
-        compute_text_loss, save_adapter,
+        resolve_num_codebooks, resolve_zero_token_id, compute_text_loss, save_adapter,
     )
     from ref_lora_training.common.dataset_builder import read_jsonl
-    from ref_lora_training.common.batching import tokenize_episode, resolve_text_pad_id, build_batch
+    from ref_lora_training.common.batching import tokenize_episode, build_batch
 
     base = load_base_model(
         moshi_root=args.moshi_root, mimi_hf_repo=args.mimi_hf_repo, device=device,
@@ -112,8 +112,20 @@ def main() -> None:
     # check fails it raises in that process, which torchrun reports as a
     # failed worker rather than hanging the others waiting on a DDP allreduce
     # that will never come.
-    forward_attempt = run_contract_check(peft_model, args.num_codebooks, vocab_size_guess, device=device)
+    forward_attempt = run_contract_check(
+        peft_model, vocab_size_guess, device=device, num_codebooks=args.num_codebooks,
+    )
     log(f"[train_worker] contract check passed on every rank, using: {forward_attempt}")
+
+    # Read the REAL codebook count and "empty" sentinel off the loaded model
+    # rather than trusting --num_codebooks blindly (see model_adapter.py's
+    # resolve_num_codebooks/resolve_zero_token_id docstrings) -- this is what
+    # actually sizes the codes tensor and fills its silent-audio channels.
+    real_num_codebooks = resolve_num_codebooks(peft_model, fallback=1 + args.num_codebooks)
+    audio_codebooks = real_num_codebooks - 1
+    zero_id = resolve_zero_token_id(peft_model)
+    log(f"[train_worker] num_codebooks={real_num_codebooks} (1 text + {audio_codebooks} audio), "
+        f"zero_token_id={zero_id}")
 
     if distributed:
         # find_unused_parameters=True: defensive default. If a LoRA target
@@ -156,8 +168,6 @@ def main() -> None:
         my_train = train_episodes
         log(f"[train_worker] {len(my_train)} train episodes (single process)")
 
-    text_pad_id = resolve_text_pad_id(tokenizer)
-
     def make_batches(episodes, batch_size, shuffle, seed=0):
         import random
         idxs = list(range(len(episodes)))
@@ -167,8 +177,8 @@ def main() -> None:
             chunk = [episodes[i] for i in idxs[start:start + batch_size]]
             tokenized = [tokenize_episode(ep, tokenizer, max_len=args.max_seq_len) for ep in chunk]
             yield build_batch(
-                tokenized, num_audio_codebooks=args.num_codebooks,
-                text_pad_id=text_pad_id, device=device,
+                tokenized, num_audio_codebooks=audio_codebooks,
+                text_pad_id=zero_id, audio_pad_id=zero_id, device=device,
             )
 
     trainable_params = [p for p in peft_model.parameters() if p.requires_grad]

@@ -17,6 +17,15 @@ Only assistant-speech tokens are supervised (loss_mask=1); the system
 prompt, the user's words, and the <ref>/<lookup> block itself are context
 and receive gradient exactly as they would in ordinary prompt-masked causal
 LM SFT.
+
+`loss_mask` is aligned DIRECTLY with `codes[:, 0, :]` (no shift-by-one):
+`LMModel.forward_train` (confirmed via source inspection -- see
+model_adapter.py's module docstring) already applies its own internal delay
+pattern and re-aligns its output logits back to the same time indices as the
+input codes, so `text_logits[:, t]` is already the causally-correct
+prediction FOR `codes[:, 0, t]` itself. An earlier version of this file
+shifted the mask by one on the assumption the caller had to do that
+manually, which would have silently trained against off-by-one targets.
 """
 from __future__ import annotations
 
@@ -62,41 +71,23 @@ def tokenize_episode(
     return TokenizedEpisode(ids=ids, target_mask=mask)
 
 
-def resolve_text_pad_id(tokenizer) -> int:
-    """Best-effort pad id for the text-token stream, tried in the order most
-    likely to exist across a sentencepiece object or an HF tokenizer. Prints
-    what it found so a wrong guess is visible immediately rather than baked
-    silently into every batch."""
-    for attr, is_method in (("pad_id", True), ("pad_token_id", False)):
-        try:
-            val = getattr(tokenizer, attr)
-            val = val() if is_method and callable(val) else val
-            if isinstance(val, int) and val >= 0:
-                print(f"[batching] using tokenizer.{attr} = {val} as the text pad id", flush=True)
-                return val
-        except Exception:
-            continue
-    print(
-        "[batching] could not find a pad id on the tokenizer; defaulting to 0. "
-        "Verify this against your fork (e.g. `tokenizer.encode(' ')`, or check "
-        "`lm_gen.zero_text_code` in a loaded live session) and override "
-        "TEXT_PAD_ID in the training notebook's config cell if 0 is wrong.",
-        flush=True,
-    )
-    return 0
-
-
 def build_batch(
     tokenized: list[TokenizedEpisode],
     num_audio_codebooks: int,
     text_pad_id: int,
-    audio_pad_id: int = 0,
+    audio_pad_id: int,
     device: str = "cuda",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pads a list of TokenizedEpisode to the batch's max length and returns
     (codes, loss_mask):
       codes:      [B, 1 + num_audio_codebooks, T] int64
-      loss_mask:  [B, T-1] float -- aligned to `codes[:, 0, 1:]` targets
+      loss_mask:  [B, T] float -- aligned DIRECTLY with codes[:, 0, :] (see
+                  module docstring for why no shift is applied here)
+
+    `text_pad_id` and `audio_pad_id` should both normally be the model's own
+    `zero_token_id` (see `model_adapter.resolve_zero_token_id`) -- the
+    sentinel `forward_train` itself uses to decide which positions are real,
+    not an arbitrary 0 or the text tokenizer's own (unrelated) pad id.
     """
     max_len = max(len(t.ids) for t in tokenized)
     B = len(tokenized)
@@ -109,5 +100,5 @@ def build_batch(
 
     audio_rows = torch.full((B, num_audio_codebooks, max_len), audio_pad_id, dtype=torch.long)
     codes = torch.cat([text_row.unsqueeze(1), audio_rows], dim=1).to(device)
-    loss_mask = target_mask_full[:, 1:].to(device)  # shift to align with next-token targets
+    loss_mask = target_mask_full.to(device)
     return codes, loss_mask

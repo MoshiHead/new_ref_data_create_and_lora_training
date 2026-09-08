@@ -101,30 +101,44 @@ ref_lora_training/
   checkpoints_out/        02's output lands here
 ```
 
-## The one thing you must verify before trusting a training run
+## The training forward pass, confirmed against the real source
 
 `common/model_adapter.py`'s model-loading code (`load_base_model`,
 `attach_lora`) is copied directly from `IMTalker/liveTry.py` -- it is
 guaranteed to match production because it *is* production's own loading
 logic.
 
-The training forward/loss call (`compute_text_loss`) is not copied from
-anywhere, because production never trains this model -- it only ever calls
-the streaming, no-grad inference API. That function targets the standard
-Moshi-family `LMModel` training contract (`codes: [B, K, T]`, codebook 0 =
-text), which is what PersonaPlex's own loader API is built on, but PersonaPlex
-is NVIDIA's own checkpoint/fork and its exact source could not be fetched or
-verified from the environment this was written in.
+`compute_text_loss()` calls `LMModel.forward_train(codes)`. This was
+originally a best-guess against the standard Moshi-family training contract
+(this environment had no way to fetch PersonaPlex's exact bundled `moshi`
+source), and the first real run surfaced the guess was wrong in its calling
+convention: `LMModel` has no plain `forward()` at all (`lm(codes)` raises
+`NotImplementedError('Module [LMModel] is missing the required "forward"
+function')`). Reading the actual source
+(`checkpoints/personaplex_bnb4/moshi/moshi/models/lm.py`, downloaded by
+Section 4) on a live pod resolved it: `forward_train(codes)` is the real
+training entry point, confirmed by name, signature, and behavior. Its source
+also revealed that it already handles the model's internal per-codebook
+delay pattern and re-aligns its output logits back to the same time indices
+as the input `codes` -- so `compute_text_loss` does NOT apply a manual
+shift-by-one on top (an earlier version did, which would have silently
+trained against off-by-one targets even once the call itself worked). See
+`model_adapter.py`'s module docstring and `compute_text_loss`'s own
+docstring for the full detail, including how the NaN-filled invalid
+positions `forward_train` returns are handled.
 
-`02_LoRA_Training.ipynb` Section 6 runs `run_contract_check()` specifically to
-catch this: one real forward+backward pass, on your actual RunPod GPU,
-against your actual installed `moshi` package, before any real training
-starts. If it fails, the fix is entirely contained to the `_FORWARD_ATTEMPTS`
-list at the top of `model_adapter.py` -- nothing else needs to change. The
-full multi-GPU training run (Section 8) repeats this same check independently
-on every GPU it uses, since each one is a separate process with its own
-model copy; Section 6 is a fast single-GPU preview so a bad assumption is
-caught in seconds rather than after the multi-GPU launch spins up.
+`resolve_num_codebooks()` and `resolve_zero_token_id()` read the real
+codebook count and the model's own "empty" sentinel directly off the loaded
+model (`lm.num_codebooks`, `lm.zero_token_id`) rather than trusting the
+notebook's `NUM_CODEBOOKS` config guess or an arbitrary 0 -- both confirmed
+attributes on the real class.
+
+`02_LoRA_Training.ipynb` Section 6 still runs `run_contract_check()`: one
+real forward+backward pass, on your actual GPU, before any real training
+starts, so a bad LoRA-target-module choice or a frozen-gradient bug is caught
+in seconds. The full multi-GPU training run (Section 8) repeats this same
+check independently on every GPU it uses, since each one is a separate
+process with its own model copy.
 
 ## Multi-GPU dataset generation
 
@@ -168,7 +182,13 @@ readable.
   ignores injected context -- which is the specific behavior that's broken.
 - **Loss is masked to assistant-speech tokens only.** The system prompt, the
   user's words, and the `<ref>` block itself get no gradient, same as
-  ordinary prompt-masked causal-LM SFT.
+  ordinary prompt-masked causal-LM SFT. The mask is aligned directly with
+  each input position (no shift-by-one) -- `forward_train` already applies
+  its own internal delay/shift and hands back logits realigned to the
+  original positions, and combines that with its own NaN-marked
+  delay-invalid positions, which `compute_text_loss` excludes via
+  `torch.nan_to_num` before the loss rather than after (multiplying a NaN by
+  a zero mask still produces NaN, not zero).
 - **Scope-negative examples directly target the observed contamination bug.**
   Each pairs a real grounded exchange with a second, unrelated turn (drawn
   from the same question shapes `search_helpers.rule_route_explain` already
