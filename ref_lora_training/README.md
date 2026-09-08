@@ -50,10 +50,12 @@ Deploy: point REF_LORA_DIR at the parent of that lora/ folder and
 launch run_imtalker_personaplex.sh with ENABLE_SEARCH=1
 ```
 
-Run both notebooks on RunPod. Notebook 1 needs no GPU if you use an API-based
-LLM backend (OpenAI/Anthropic) for generation; notebook 2 needs a GPU capable
-of loading the PersonaPlex 7B model (4-bit) plus LoRA training overhead -- an
-RTX 4090/5090 or A100/L40S-class pod is comfortable.
+Run both notebooks on RunPod. Notebook 1 loads a local instruct model
+(default `Qwen/Qwen2.5-14B-Instruct`, 4-bit) on the pod's own GPU to do the
+conversion -- no external API, no API key, nothing leaves the pod. Notebook 2
+needs a GPU capable of loading the PersonaPlex 7B model (4-bit) plus LoRA
+training overhead -- an RTX 4090/5090 or A100/L40S-class pod is comfortable
+for both.
 
 ## Folder layout
 
@@ -70,7 +72,9 @@ ref_lora_training/
     distractors.py        fixed pool of "no search needed" follow-up turns,
                           used to build the scope-negative examples
     generation_prompts.py the prompt sent to the conversion LLM
-    llm_backends.py       thin OpenAI / Anthropic / local-HF dispatcher
+    llm_backends.py       loads a local instruct model (Qwen2.5-14B-Instruct
+                          by default) on the pod's GPU and calls it -- no
+                          external API
     dataset_builder.py    QA rows -> episodes -> validated JSONL
     model_adapter.py      loads PersonaPlex like liveTry.py does, attaches
                           peft LoRA, and the training forward/loss -- READ
