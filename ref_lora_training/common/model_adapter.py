@@ -257,21 +257,39 @@ def compute_text_loss(
     silently trained against off-by-one targets.
 
     `forward_train` deliberately fills logits at delay-invalid positions with
-    NaN (confirmed in its source) and returns a companion `text_logits_mask`
+    NaN (confirmed in its source) and returns a companion validity mask
     marking which positions are real. Both `loss_mask` (your supervision
     mask) and that validity mask are combined, and the NaN entries are
     zeroed out before the cross-entropy call -- multiplying a NaN by a 0 mask
     does NOT produce 0, it produces NaN, so this must happen before, not
-    after, the loss is computed."""
-    out = lm.forward_train(codes)
-    text_logits = getattr(out, "text_logits", None)
-    if text_logits is None:
-        text_logits = out[2]  # LMOutput(logits, logits_mask, text_logits, text_logits_mask)
-    text_logits = text_logits[:, 0]  # [B, 1, T, V] -> [B, T, V]
+    after, the loss is computed.
 
-    valid_mask = getattr(out, "text_logits_mask", None)
-    if valid_mask is None:
-        valid_mask = out[3]
+    `LMOutput` is a plain `@dataclass` (not a NamedTuple, so it is NOT
+    subscriptable -- `out[3]` raises `TypeError`), and its field names do not
+    all match the local variable names used where it's constructed in
+    `forward_train`'s source (`return LMOutput(logits, logits_mask,
+    text_logits, text_logits_mask)`): the 3rd positional field genuinely is
+    named `text_logits`, confirmed live, but the 4th is not necessarily named
+    `text_logits_mask`. Rather than guess its real name too, this reads
+    `LMOutput`'s fields by POSITION via `dataclasses.fields()`, which is
+    exactly as reliable as reading the source's positional constructor call
+    and does not depend on knowing the name at all."""
+    import dataclasses
+
+    out = lm.forward_train(codes)
+    if dataclasses.is_dataclass(out) and not isinstance(out, type):
+        values = [getattr(out, f.name) for f in dataclasses.fields(out)]
+    elif isinstance(out, tuple):
+        values = list(out)
+    else:
+        raise TypeError(
+            f"forward_train returned {type(out)!r}, which is neither a dataclass instance "
+            "nor a tuple/NamedTuple -- inspect it directly (`dataclasses.fields(out)` or "
+            "`out._fields`) and adjust compute_text_loss accordingly."
+        )
+    # Positional order per forward_train's source: (logits, logits_mask, text_logits, text_logits_mask)
+    text_logits, valid_mask = values[2], values[3]
+    text_logits = text_logits[:, 0]  # [B, 1, T, V] -> [B, T, V]
     valid_mask = valid_mask[:, 0].to(loss_mask.dtype)  # [B, 1, T] -> [B, T]
 
     targets = codes[:, 0, :]  # [B, T] -- direct correspondence, see docstring
