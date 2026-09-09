@@ -170,6 +170,22 @@ Output from every rank streams live into the cell; only rank 0 saves
 checkpoints and prints the periodic loss/eval lines to keep the log
 readable.
 
+**Known container gotcha, already worked around:** a 5-GPU run repeatedly hit
+a random rank (a different one each time -- 0, then 4, then 1) failing
+`DistributedDataParallel`'s constructor-time ALLGATHER after exactly the
+configured timeout, reported as that rank having "0 params" even though every
+rank's own diagnostic print showed the correct count right before the DDP
+wrap. A random rank silently failing a collective with no real code-level
+difference between ranks is the signature of NCCL running out of shared
+memory for intra-node communication -- the most common cause inside a Docker
+container (which is what a RunPod pod is) being `/dev/shm` defaulting to a
+small size (often 64MB) never resized for multi-process GPU communication.
+`launch_ddp_training` now sets `NCCL_SHM_DISABLE=1` by default, which makes
+NCCL use a different transport for same-node GPU-to-GPU traffic instead of
+depending on `/dev/shm` at all (a small intra-node bandwidth cost, not a
+correctness one), and prints `/dev/shm`'s actual size before every launch for
+visibility.
+
 ## Design choices worth knowing about
 
 - **Silent-audio training.** Every training example is represented as

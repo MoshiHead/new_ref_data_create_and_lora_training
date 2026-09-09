@@ -17,19 +17,18 @@ from __future__ import annotations
 import os
 
 # Must be set before the first `import torch` anywhere in this process (both
-# below and inside setup_distributed()/main()). A 5-GPU run produced one rank
-# ending up with ZERO trainable LoRA parameters by the time DistributedDataParallel
-# wrapped it, even though peft's own print_trainable_parameters() showed the
-# identical, correct count on every rank right after attach_lora() -- i.e. the
-# divergence happened in the narrow window between LoRA attachment and the DDP
-# wrap, on exactly one process out of five. The only other asymmetry visible in
-# that run's log was `torch/_inductor/compile_fx.py` TF32 warnings firing on
-# some ranks but not others, meaning torch.compile/dynamo tracing (most likely
-# triggered by bitsandbytes' newer compiled dequantization kernels) was active
-# and behaving inconsistently across concurrent processes -- a known source of
-# exactly this kind of cross-process nondeterminism. Disabling it removes an
-# entire class of multi-process compile-cache races; eager-mode QLoRA training
-# at this parameter scale does not need it.
+# below and inside setup_distributed()/main()). A 5-GPU run showed
+# `torch/_inductor/compile_fx.py` TF32 warnings firing on some ranks but not
+# others right before one rank failed a DDP collective -- a plausible source
+# of cross-process nondeterminism, so this was disabled as a precaution.
+# NOTE: a follow-up run with these warnings fully gone (confirming dynamo
+# really was off) hit the SAME class of failure on a different, still random
+# rank -- so torch.compile was NOT the actual root cause. The real cause
+# turned out to be NCCL running low on shared memory for intra-node
+# communication (a `/dev/shm` size issue common in containers), worked around
+# in `launch_training.launch_ddp_training` via NCCL_SHM_DISABLE=1. Keeping
+# dynamo disabled here anyway since eager-mode QLoRA training at this
+# parameter scale doesn't need it and it removes one variable.
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 

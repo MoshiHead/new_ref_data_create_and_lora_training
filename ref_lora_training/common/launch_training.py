@@ -11,6 +11,7 @@ the 4-bit 7B model comfortably fits on a single modern GPU).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,33 @@ from typing import Optional
 
 from .multi_gpu_runner import detect_gpu_count
 from .proc_utils import run_streaming
+
+
+def _print_shm_size() -> None:
+    """Prints /dev/shm's size and warns if it looks too small for NCCL.
+
+    A prior 5-GPU run repeatedly failed with one rank (a DIFFERENT rank each
+    time -- 0, then 4, then 1) never completing the ALLGATHER collective that
+    DistributedDataParallel's constructor uses to verify every rank has the
+    same model, timing out after exactly the configured timeout and then
+    reporting that rank as having "0 params" (an artifact of the timeout
+    handling, not a real parameter mismatch -- every rank's own diagnostic
+    print showed 152 trainable params right before the DDP wrap, every time).
+    A random rank silently failing a collective, with no code-level
+    difference between ranks, is the classic signature of NCCL running out of
+    shared memory for its intra-node communication buffers -- and the most
+    common cause of that inside a Docker container (which is what a RunPod
+    pod is) is `/dev/shm` defaulting to a small size (often 64MB) that was
+    never resized for multi-process GPU communication. This won't be fixed by
+    anything in this notebook (resizing /dev/shm requires a remount, done
+    outside a running container or via RunPod's pod configuration) so this
+    just makes the size visible; `launch_ddp_training` works around it
+    directly by setting NCCL_SHM_DISABLE=1 regardless of what this reports."""
+    try:
+        result = subprocess.run(["df", "-h", "/dev/shm"], capture_output=True, text=True, timeout=10)
+        print(f"[launch_training] /dev/shm:\n{result.stdout}", flush=True)
+    except Exception as e:
+        print(f"[launch_training] could not check /dev/shm size ({e!r})", flush=True)
 
 
 def check_gpus_clean(n_gpus: int, max_used_mib: int = 1500) -> None:
@@ -109,6 +137,7 @@ def launch_ddp_training(
 ) -> None:
     n_gpus = n_gpus or detect_gpu_count()
     check_gpus_clean(n_gpus)
+    _print_shm_size()
     worker_script = Path(__file__).resolve().parent / "train_worker.py"
     project_root = Path(__file__).resolve().parents[2]
 
@@ -143,8 +172,20 @@ def launch_ddp_training(
     if hf_token:
         cmd += ["--hf_token", hf_token]
 
-    print(f"[launch_training] {n_gpus} GPU(s) -> torchrun --nproc_per_node={n_gpus}", flush=True)
-    code = run_streaming(cmd, cwd=str(project_root), prefix="[torchrun]")
+    # A prior run's ALLGATHER-timeout-on-a-random-rank failure (see
+    # _print_shm_size's docstring) is the textbook symptom of NCCL running out
+    # of shared memory for intra-node communication -- common in containers
+    # with a small /dev/shm. NCCL_SHM_DISABLE=1 makes NCCL use a different
+    # transport for same-node GPU-to-GPU communication instead of relying on
+    # /dev/shm at all, trading a little intra-node bandwidth for eliminating
+    # this entire failure mode. Only set if the caller hasn't already
+    # overridden it (e.g. to test disabling this workaround).
+    env = os.environ.copy()
+    env.setdefault("NCCL_SHM_DISABLE", "1")
+
+    print(f"[launch_training] {n_gpus} GPU(s) -> torchrun --nproc_per_node={n_gpus} "
+          f"(NCCL_SHM_DISABLE={env['NCCL_SHM_DISABLE']})", flush=True)
+    code = run_streaming(cmd, env=env, cwd=str(project_root), prefix="[torchrun]")
     if code != 0:
         raise RuntimeError(
             f"training exited with code {code} -- scroll up in this cell's output for the "
