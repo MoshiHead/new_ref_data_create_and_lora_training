@@ -188,11 +188,18 @@ out after the full configured window. The debugging trail so far:
    communicate over a socket -- a self-inflicted hang, not the original
    problem. Lesson logged here so it isn't repeated: don't stack untested
    NCCL transport-disabling env vars: change one at a time.
-3. Current state: only `NCCL_IB_DISABLE=1` (inert on a single-node pod
-   regardless) and `NCCL_DEBUG=INFO` are set, leaving NCCL's normal P2P/SHM
-   transports intact so it can actually group same-node ranks correctly,
-   while still surfacing its own transport-selection log for whatever the
-   real underlying cause turns out to be.
+3. With only `NCCL_IB_DISABLE=1` and `NCCL_DEBUG=INFO` set, a follow-up run's
+   log showed the communicator setup succeeding COMPLETELY and CORRECTLY:
+   `nNodes 1 localRanks 5` (right topology), every rank reaching "Init
+   COMPLETE", rings connected. So GPU-to-GPU communication is not
+   structurally broken. The ALLGATHER still hung for the full timeout anyway
+   -- and it's moving a single element per rank (`NumelIn=1`), which should
+   complete in microseconds on a genuinely working channel. The channel log
+   showed `via P2P/CUMEM`: NCCL's newer CUDA-VMM-based peer memory mapping,
+   which has a known class of bug on some driver/virtualization combinations
+   where the mapping handshake succeeds but real data transfer through it
+   hangs. Current state: `NCCL_CUMEM_ENABLE=0` added (alone, not stacked)
+   to force the older, more broadly-compatible legacy P2P/IPC memory path.
 
 ## Design choices worth knowing about
 

@@ -176,13 +176,30 @@ def launch_ddp_training(
     # so this is inert either way) plus NCCL_DEBUG=INFO so NCCL's own
     # transport-selection log is visible with its NORMAL same-node transports
     # (P2P, SHM) left intact and able to actually group the ranks correctly.
+    #
+    # With those two alone, a follow-up run's NCCL_DEBUG=INFO output showed
+    # the communicator setup succeeding completely and correctly this time
+    # (`nNodes 1 localRanks 5`, every rank reaching "Init COMPLETE", rings
+    # connected) -- so GPU-to-GPU communication itself is NOT broken. The
+    # ALLGATHER still hung for the full timeout regardless, and it's moving a
+    # single element per rank (NumelIn=1) -- something that should complete
+    # in microseconds on a genuinely working channel. The channel logs show
+    # `via P2P/CUMEM`: NCCL's newer CUDA-VMM-based peer-memory mapping, which
+    # has a known class of bug on some driver/virtualization combinations
+    # where the mapping handshake succeeds but real data transfer through it
+    # hangs. NCCL_CUMEM_ENABLE=0 forces the older, more broadly-compatible
+    # legacy P2P/IPC memory path instead -- added alone (not stacked with
+    # anything else) so a next failure, if any, isolates cleanly to this one
+    # change.
     env = os.environ.copy()
     env.setdefault("NCCL_IB_DISABLE", "1")
     env.setdefault("NCCL_DEBUG", "INFO")
+    env.setdefault("NCCL_CUMEM_ENABLE", "0")
 
     print(
         f"[launch_training] {n_gpus} GPU(s) -> torchrun --nproc_per_node={n_gpus} "
-        f"(NCCL_IB_DISABLE={env['NCCL_IB_DISABLE']} NCCL_DEBUG={env['NCCL_DEBUG']})",
+        f"(NCCL_IB_DISABLE={env['NCCL_IB_DISABLE']} NCCL_DEBUG={env['NCCL_DEBUG']} "
+        f"NCCL_CUMEM_ENABLE={env['NCCL_CUMEM_ENABLE']})",
         flush=True,
     )
     code = run_streaming(cmd, env=env, cwd=str(project_root), prefix="[torchrun]")
