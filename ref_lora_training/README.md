@@ -170,21 +170,27 @@ Output from every rank streams live into the cell; only rank 0 saves
 checkpoints and prints the periodic loss/eval lines to keep the log
 readable.
 
-**Known container gotcha, already worked around:** a 5-GPU run repeatedly hit
-a random rank (a different one each time -- 0, then 4, then 1) failing
-`DistributedDataParallel`'s constructor-time ALLGATHER after exactly the
-configured timeout, reported as that rank having "0 params" even though every
-rank's own diagnostic print showed the correct count right before the DDP
-wrap. A random rank silently failing a collective with no real code-level
-difference between ranks is the signature of NCCL running out of shared
-memory for intra-node communication -- the most common cause inside a Docker
-container (which is what a RunPod pod is) being `/dev/shm` defaulting to a
-small size (often 64MB) never resized for multi-process GPU communication.
-`launch_ddp_training` now sets `NCCL_SHM_DISABLE=1` by default, which makes
-NCCL use a different transport for same-node GPU-to-GPU traffic instead of
-depending on `/dev/shm` at all (a small intra-node bandwidth cost, not a
-correctness one), and prints `/dev/shm`'s actual size before every launch for
-visibility.
+**Known container gotcha, worked around (still being narrowed down):** a
+5-GPU run repeatedly hit `DistributedDataParallel`'s constructor-time
+ALLGATHER timing out after the full configured window. First it looked like
+one random rank (0, then 4, then 1) reported as having "0 params" while
+every rank's own diagnostic print showed the correct count -- initially
+suspected as `/dev/shm` being too small for NCCL's intra-node buffers (a
+common Docker default). A run with `NCCL_SHM_DISABLE=1` ruled that out
+(`/dev/shm` had 352GB free) but hit the SAME failure, this time with EVERY
+rank timing out simultaneously and each blaming a different, mutually
+contradictory rank for "0 params" -- rank 0 blamed rank 1 while ranks 1-4 all
+blamed rank 0. That circular pattern is what comparing against uninitialized
+memory after a collective that never actually completed looks like, not a
+real mismatch. The next most likely cause of NCCL's GPU-to-GPU communication
+never establishing on a single multi-GPU node is broken CUDA P2P/topology
+access -- common on virtualized/cloud GPU instances where the hypervisor's
+ACS setting blocks direct GPU-to-GPU PCIe DMA. `launch_ddp_training` now also
+sets `NCCL_P2P_DISABLE=1` (routes GPU-to-GPU traffic through host memory
+instead of direct P2P) and `NCCL_IB_DISABLE=1` (skips an InfiniBand attempt
+that isn't relevant on a single-node pod), plus `NCCL_DEBUG=INFO` so that if
+this still isn't the fix, NCCL's own transport-selection log will show
+exactly what's failing instead of it needing to be guessed at again.
 
 ## Design choices worth knowing about
 

@@ -172,19 +172,39 @@ def launch_ddp_training(
     if hf_token:
         cmd += ["--hf_token", hf_token]
 
-    # A prior run's ALLGATHER-timeout-on-a-random-rank failure (see
-    # _print_shm_size's docstring) is the textbook symptom of NCCL running out
-    # of shared memory for intra-node communication -- common in containers
-    # with a small /dev/shm. NCCL_SHM_DISABLE=1 makes NCCL use a different
-    # transport for same-node GPU-to-GPU communication instead of relying on
-    # /dev/shm at all, trading a little intra-node bandwidth for eliminating
-    # this entire failure mode. Only set if the caller hasn't already
-    # overridden it (e.g. to test disabling this workaround).
+    # A 5-GPU run's ALLGATHER collective timed out after the full configured
+    # window with EVERY rank failing simultaneously, and each rank reported a
+    # DIFFERENT, mutually contradictory "other rank" as having 0 params
+    # (rank 0 blamed rank 1; ranks 1-4 all blamed rank 0) -- that circular
+    # pattern is what comparing against uninitialized memory after a
+    # collective that never actually ran looks like, not a real parameter
+    # mismatch. /dev/shm had 352GB free on that run, ruling out the shared-
+    # memory theory NCCL_SHM_DISABLE was originally added for (kept anyway,
+    # it's harmless). The next most common cause of NCCL GPU-to-GPU
+    # communication simply never establishing on a single multi-GPU node is
+    # broken CUDA P2P/topology access -- common on virtualized/cloud GPU
+    # instances where the hypervisor's ACS (Access Control Services) setting
+    # blocks direct GPU-to-GPU PCIe DMA even though the GPUs are on the same
+    # host. NCCL_P2P_DISABLE=1 forces all GPU-to-GPU traffic through host
+    # memory instead of direct P2P, which is slower but sidesteps a broken
+    # P2P path entirely; NCCL_IB_DISABLE=1 stops NCCL from attempting
+    # InfiniBand transport that likely isn't actually configured on a single-
+    # node pod anyway. NCCL_DEBUG=INFO is the important one if this combination
+    # STILL doesn't fix it: it makes NCCL print its own transport-selection
+    # and error diagnostics, which will show exactly what's failing instead of
+    # this having to be guessed at again.
     env = os.environ.copy()
     env.setdefault("NCCL_SHM_DISABLE", "1")
+    env.setdefault("NCCL_P2P_DISABLE", "1")
+    env.setdefault("NCCL_IB_DISABLE", "1")
+    env.setdefault("NCCL_DEBUG", "INFO")
 
-    print(f"[launch_training] {n_gpus} GPU(s) -> torchrun --nproc_per_node={n_gpus} "
-          f"(NCCL_SHM_DISABLE={env['NCCL_SHM_DISABLE']})", flush=True)
+    print(
+        f"[launch_training] {n_gpus} GPU(s) -> torchrun --nproc_per_node={n_gpus} "
+        f"(NCCL_SHM_DISABLE={env['NCCL_SHM_DISABLE']} NCCL_P2P_DISABLE={env['NCCL_P2P_DISABLE']} "
+        f"NCCL_IB_DISABLE={env['NCCL_IB_DISABLE']} NCCL_DEBUG={env['NCCL_DEBUG']})",
+        flush=True,
+    )
     code = run_streaming(cmd, env=env, cwd=str(project_root), prefix="[torchrun]")
     if code != 0:
         raise RuntimeError(
