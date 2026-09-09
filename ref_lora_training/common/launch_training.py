@@ -22,25 +22,13 @@ from .proc_utils import run_streaming
 
 
 def _print_shm_size() -> None:
-    """Prints /dev/shm's size and warns if it looks too small for NCCL.
+    """Prints /dev/shm's size, purely informational.
 
-    A prior 5-GPU run repeatedly failed with one rank (a DIFFERENT rank each
-    time -- 0, then 4, then 1) never completing the ALLGATHER collective that
-    DistributedDataParallel's constructor uses to verify every rank has the
-    same model, timing out after exactly the configured timeout and then
-    reporting that rank as having "0 params" (an artifact of the timeout
-    handling, not a real parameter mismatch -- every rank's own diagnostic
-    print showed 152 trainable params right before the DDP wrap, every time).
-    A random rank silently failing a collective, with no code-level
-    difference between ranks, is the classic signature of NCCL running out of
-    shared memory for its intra-node communication buffers -- and the most
-    common cause of that inside a Docker container (which is what a RunPod
-    pod is) is `/dev/shm` defaulting to a small size (often 64MB) that was
-    never resized for multi-process GPU communication. This won't be fixed by
-    anything in this notebook (resizing /dev/shm requires a remount, done
-    outside a running container or via RunPod's pod configuration) so this
-    just makes the size visible; `launch_ddp_training` works around it
-    directly by setting NCCL_SHM_DISABLE=1 regardless of what this reports."""
+    Initially suspected as the cause of a DistributedDataParallel ALLGATHER
+    hang (small /dev/shm is a common Docker default and NCCL does use it for
+    intra-node buffers), but a real run showed 352GB free, ruling that out --
+    kept here since it's a cheap, useful fact to have visible in the log for
+    any future NCCL issue, not because it's currently a known problem."""
     try:
         result = subprocess.run(["df", "-h", "/dev/shm"], capture_output=True, text=True, timeout=10)
         print(f"[launch_training] /dev/shm:\n{result.stdout}", flush=True)
@@ -172,37 +160,29 @@ def launch_ddp_training(
     if hf_token:
         cmd += ["--hf_token", hf_token]
 
-    # A 5-GPU run's ALLGATHER collective timed out after the full configured
-    # window with EVERY rank failing simultaneously, and each rank reported a
-    # DIFFERENT, mutually contradictory "other rank" as having 0 params
-    # (rank 0 blamed rank 1; ranks 1-4 all blamed rank 0) -- that circular
-    # pattern is what comparing against uninitialized memory after a
-    # collective that never actually ran looks like, not a real parameter
-    # mismatch. /dev/shm had 352GB free on that run, ruling out the shared-
-    # memory theory NCCL_SHM_DISABLE was originally added for (kept anyway,
-    # it's harmless). The next most common cause of NCCL GPU-to-GPU
-    # communication simply never establishing on a single multi-GPU node is
-    # broken CUDA P2P/topology access -- common on virtualized/cloud GPU
-    # instances where the hypervisor's ACS (Access Control Services) setting
-    # blocks direct GPU-to-GPU PCIe DMA even though the GPUs are on the same
-    # host. NCCL_P2P_DISABLE=1 forces all GPU-to-GPU traffic through host
-    # memory instead of direct P2P, which is slower but sidesteps a broken
-    # P2P path entirely; NCCL_IB_DISABLE=1 stops NCCL from attempting
-    # InfiniBand transport that likely isn't actually configured on a single-
-    # node pod anyway. NCCL_DEBUG=INFO is the important one if this combination
-    # STILL doesn't fix it: it makes NCCL print its own transport-selection
-    # and error diagnostics, which will show exactly what's failing instead of
-    # this having to be guessed at again.
+    # Two earlier fixes were tried and both are now known NOT to be the cause:
+    # /dev/shm had 352GB free (ruling out NCCL_SHM_DISABLE's original reason
+    # for existing), and stacking NCCL_SHM_DISABLE=1 together with
+    # NCCL_P2P_DISABLE=1 turned out to be actively HARMFUL, confirmed by
+    # NCCL_DEBUG=INFO output: with BOTH of NCCL's only same-node grouping
+    # mechanisms (P2P and shared memory) disabled at once, NCCL had no way
+    # left to recognize that all 5 GPUs share one host, and its own log showed
+    # `nNodes 5 localRanks 1` for every rank -- i.e. it was treating each GPU
+    # as an isolated single-GPU "node" forced to communicate over a socket,
+    # which is what actually produced the hang, not whatever the original
+    # problem was. Lesson: disabling both at once was never a real fix, it
+    # replaced the mystery with a self-inflicted one. Only NCCL_IB_DISABLE=1
+    # is kept (there is no InfiniBand fabric on a single-node pod regardless,
+    # so this is inert either way) plus NCCL_DEBUG=INFO so NCCL's own
+    # transport-selection log is visible with its NORMAL same-node transports
+    # (P2P, SHM) left intact and able to actually group the ranks correctly.
     env = os.environ.copy()
-    env.setdefault("NCCL_SHM_DISABLE", "1")
-    env.setdefault("NCCL_P2P_DISABLE", "1")
     env.setdefault("NCCL_IB_DISABLE", "1")
     env.setdefault("NCCL_DEBUG", "INFO")
 
     print(
         f"[launch_training] {n_gpus} GPU(s) -> torchrun --nproc_per_node={n_gpus} "
-        f"(NCCL_SHM_DISABLE={env['NCCL_SHM_DISABLE']} NCCL_P2P_DISABLE={env['NCCL_P2P_DISABLE']} "
-        f"NCCL_IB_DISABLE={env['NCCL_IB_DISABLE']} NCCL_DEBUG={env['NCCL_DEBUG']})",
+        f"(NCCL_IB_DISABLE={env['NCCL_IB_DISABLE']} NCCL_DEBUG={env['NCCL_DEBUG']})",
         flush=True,
     )
     code = run_streaming(cmd, env=env, cwd=str(project_root), prefix="[torchrun]")

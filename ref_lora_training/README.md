@@ -170,27 +170,29 @@ Output from every rank streams live into the cell; only rank 0 saves
 checkpoints and prints the periodic loss/eval lines to keep the log
 readable.
 
-**Known container gotcha, worked around (still being narrowed down):** a
-5-GPU run repeatedly hit `DistributedDataParallel`'s constructor-time
-ALLGATHER timing out after the full configured window. First it looked like
-one random rank (0, then 4, then 1) reported as having "0 params" while
-every rank's own diagnostic print showed the correct count -- initially
-suspected as `/dev/shm` being too small for NCCL's intra-node buffers (a
-common Docker default). A run with `NCCL_SHM_DISABLE=1` ruled that out
-(`/dev/shm` had 352GB free) but hit the SAME failure, this time with EVERY
-rank timing out simultaneously and each blaming a different, mutually
-contradictory rank for "0 params" -- rank 0 blamed rank 1 while ranks 1-4 all
-blamed rank 0. That circular pattern is what comparing against uninitialized
-memory after a collective that never actually completed looks like, not a
-real mismatch. The next most likely cause of NCCL's GPU-to-GPU communication
-never establishing on a single multi-GPU node is broken CUDA P2P/topology
-access -- common on virtualized/cloud GPU instances where the hypervisor's
-ACS setting blocks direct GPU-to-GPU PCIe DMA. `launch_ddp_training` now also
-sets `NCCL_P2P_DISABLE=1` (routes GPU-to-GPU traffic through host memory
-instead of direct P2P) and `NCCL_IB_DISABLE=1` (skips an InfiniBand attempt
-that isn't relevant on a single-node pod), plus `NCCL_DEBUG=INFO` so that if
-this still isn't the fix, NCCL's own transport-selection log will show
-exactly what's failing instead of it needing to be guessed at again.
+**Known container gotcha, still being narrowed down.** A 5-GPU run
+repeatedly hit `DistributedDataParallel`'s constructor-time ALLGATHER timing
+out after the full configured window. The debugging trail so far:
+
+1. First it looked like one random rank (0, then 4, then 1) reported as
+   having "0 params" while every rank's own diagnostic print showed the
+   correct count -- suspected as `/dev/shm` being too small for NCCL's
+   intra-node buffers (a common Docker default). Ruled out: a real run showed
+   352GB free.
+2. Adding `NCCL_P2P_DISABLE=1` *alongside* the (unnecessary) `NCCL_SHM_DISABLE=1`
+   made things WORSE, not better -- `NCCL_DEBUG=INFO` output showed NCCL
+   reporting `nNodes 5 localRanks 1` for a run with all 5 GPUs on one host.
+   P2P and shared memory are NCCL's only two mechanisms for recognizing GPUs
+   share a node; disabling both left it no way to group the ranks, so it fell
+   back to treating each GPU as an isolated single-GPU "node" forced to
+   communicate over a socket -- a self-inflicted hang, not the original
+   problem. Lesson logged here so it isn't repeated: don't stack untested
+   NCCL transport-disabling env vars: change one at a time.
+3. Current state: only `NCCL_IB_DISABLE=1` (inert on a single-node pod
+   regardless) and `NCCL_DEBUG=INFO` are set, leaving NCCL's normal P2P/SHM
+   transports intact so it can actually group same-node ranks correctly,
+   while still surfacing its own transport-selection log for whatever the
+   real underlying cause turns out to be.
 
 ## Design choices worth knowing about
 
