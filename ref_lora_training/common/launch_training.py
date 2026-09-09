@@ -20,19 +20,33 @@ from .multi_gpu_runner import detect_gpu_count
 from .proc_utils import run_streaming
 
 
-def check_gpus_clean(n_gpus: int, max_used_mib: int = 300) -> None:
+def check_gpus_clean(n_gpus: int, max_used_mib: int = 1500) -> None:
     """Raises if any of the first `n_gpus` GPUs already has significant
     memory in use before a fresh multi-GPU launch. A prior run repeatedly
     crashed with rank 0 (which always maps to GPU 0) aborting during
     DistributedDataParallel setup, and that pod's `nvidia-smi` showed GPU 0
-    already holding ~2.2GB while every other GPU showed ~0 -- almost
-    certainly a stale allocation or half-torn-down CUDA context left behind
-    by an earlier in-notebook model load (e.g. the Section 6 single-GPU
-    contract check) or a previous crashed torchrun launch that didn't clean
-    up. Launching a fresh 5-way DDP run onto a GPU already in that state is
-    exactly the kind of thing that produces confusing, rank-specific
-    failures. This is a cheap, fast check that turns that into a clear error
-    with an actionable fix instead of another multi-minute failed run."""
+    already holding ~2.2GB (later ~11.7GB) while every other GPU showed ~0 --
+    almost certainly a stale allocation left behind by an earlier in-notebook
+    model load (e.g. the Section 6 single-GPU contract check) or a previous
+    crashed torchrun launch that didn't clean up. Launching a fresh 5-way DDP
+    run onto a GPU already in that state is exactly the kind of thing that
+    produces confusing, rank-specific failures. This is a cheap, fast check
+    that turns that into a clear error with an actionable fix instead of
+    another multi-minute failed run.
+
+    `max_used_mib` defaults to 1500, not near-zero: once a process has ever
+    used a GPU via CUDA, that process keeps a baseline context footprint on
+    it (typically 300-600 MiB) for as long as the process lives -- this is
+    the CUDA runtime/driver context itself, not cached-but-reusable
+    allocator memory, so `torch.cuda.empty_cache()` cannot release it; only
+    the process exiting (e.g. a kernel restart) does. A notebook that has
+    ever loaded a model for the Section 6 contract check will show this
+    baseline on GPU 0 forever after, and it is completely harmless to launch
+    training alongside (a few hundred MB against a 40GB+ GPU). The threshold
+    is set well above that normal baseline and well below what even a
+    fraction of a leaked 4-bit 7B model would leave behind (multiple GB), so
+    it only fires on the actual problem case, not on ordinary CUDA context
+    overhead."""
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
