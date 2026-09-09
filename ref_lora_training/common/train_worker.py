@@ -14,10 +14,29 @@ Can be run directly for debugging a single GPU without torchrun:
 """
 from __future__ import annotations
 
-import argparse
 import os
+
+# Must be set before the first `import torch` anywhere in this process (both
+# below and inside setup_distributed()/main()). A 5-GPU run produced one rank
+# ending up with ZERO trainable LoRA parameters by the time DistributedDataParallel
+# wrapped it, even though peft's own print_trainable_parameters() showed the
+# identical, correct count on every rank right after attach_lora() -- i.e. the
+# divergence happened in the narrow window between LoRA attachment and the DDP
+# wrap, on exactly one process out of five. The only other asymmetry visible in
+# that run's log was `torch/_inductor/compile_fx.py` TF32 warnings firing on
+# some ranks but not others, meaning torch.compile/dynamo tracing (most likely
+# triggered by bitsandbytes' newer compiled dequantization kernels) was active
+# and behaving inconsistently across concurrent processes -- a known source of
+# exactly this kind of cross-process nondeterminism. Disabling it removes an
+# entire class of multi-process compile-cache races; eager-mode QLoRA training
+# at this parameter scale does not need it.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
+import argparse
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -37,7 +56,13 @@ def setup_distributed():
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
         torch.cuda.set_device(local_rank)
         if world_size > 1:
-            dist.init_process_group(backend="nccl", init_method="env://")
+            # Default NCCL timeout is 10 minutes -- fine for a genuinely slow
+            # collective, but it means any real bug that makes one rank never
+            # reach a collective (like the "one rank has 0 trainable params"
+            # issue this file's top-of-module comment describes) costs a full
+            # 10-minute hang before the error is even visible. 2 minutes is
+            # still generous for process-group setup and small allgathers.
+            dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(seconds=120))
         return rank, world_size, local_rank, world_size > 1
     return 0, 1, 0, False
 
@@ -126,6 +151,28 @@ def main() -> None:
     zero_id = resolve_zero_token_id(peft_model)
     log(f"[train_worker] num_codebooks={real_num_codebooks} (1 text + {audio_codebooks} audio), "
         f"zero_token_id={zero_id}")
+
+    # Printed by EVERY rank (not just rank 0) and deliberately right before the
+    # DDP wrap: a prior 5-GPU run had every rank agree on 19,070,976 trainable
+    # params right after attach_lora(), yet DistributedDataParallel's own
+    # cross-rank check found one rank with 0 by the time it wrapped the model
+    # -- i.e. something zeroed out requires_grad on exactly one process in
+    # between. If that happens again, this line pinpoints which rank and
+    # whether it's literally the parameter count or something else (e.g. a
+    # rank landing on the wrong device).
+    n_trainable = sum(1 for p in peft_model.parameters() if p.requires_grad)
+    print(
+        f"[train_worker rank {rank}] trainable parameter tensors right before DDP wrap: {n_trainable}",
+        flush=True,
+    )
+    if n_trainable == 0:
+        raise RuntimeError(
+            f"rank {rank} has 0 trainable parameters right before the DDP wrap, even though "
+            "attach_lora() reported nonzero trainable params earlier in this same process's log "
+            "-- something zeroed requires_grad in between. Re-run with TORCHDYNAMO_DISABLE=1 / "
+            "TORCH_COMPILE_DISABLE=1 already set (this file sets them by default now); if it "
+            "still happens, suspect a bitsandbytes/CUDA race specific to this rank's GPU."
+        )
 
     if distributed:
         # find_unused_parameters=True: defensive default. If a LoRA target
