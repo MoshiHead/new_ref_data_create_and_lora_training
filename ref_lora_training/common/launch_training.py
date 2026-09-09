@@ -11,12 +11,62 @@ the 4-bit 7B model comfortably fits on a single modern GPU).
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
 from .multi_gpu_runner import detect_gpu_count
 from .proc_utils import run_streaming
+
+
+def check_gpus_clean(n_gpus: int, max_used_mib: int = 300) -> None:
+    """Raises if any of the first `n_gpus` GPUs already has significant
+    memory in use before a fresh multi-GPU launch. A prior run repeatedly
+    crashed with rank 0 (which always maps to GPU 0) aborting during
+    DistributedDataParallel setup, and that pod's `nvidia-smi` showed GPU 0
+    already holding ~2.2GB while every other GPU showed ~0 -- almost
+    certainly a stale allocation or half-torn-down CUDA context left behind
+    by an earlier in-notebook model load (e.g. the Section 6 single-GPU
+    contract check) or a previous crashed torchrun launch that didn't clean
+    up. Launching a fresh 5-way DDP run onto a GPU already in that state is
+    exactly the kind of thing that produces confusing, rank-specific
+    failures. This is a cheap, fast check that turns that into a clear error
+    with an actionable fix instead of another multi-minute failed run."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+    except Exception as e:
+        print(f"[launch_training] could not run nvidia-smi to pre-check GPU memory ({e!r}); "
+              "skipping this check.", flush=True)
+        return
+
+    dirty = []
+    for line in result.stdout.strip().splitlines():
+        idx_str, used_str = (p.strip() for p in line.split(","))
+        idx, used_mib = int(idx_str), int(used_str)
+        if idx < n_gpus and used_mib > max_used_mib:
+            dirty.append((idx, used_mib))
+
+    if dirty:
+        listing = ", ".join(f"GPU {i}: {m} MiB used" for i, m in dirty)
+        raise RuntimeError(
+            f"Refusing to launch a {n_gpus}-GPU training run: {listing} already has significant "
+            f"memory allocated (threshold {max_used_mib} MiB) before this run even started. This "
+            "is very likely a stale allocation from an earlier in-notebook model load (the "
+            "Section 6 contract-check cell) or a half-torn-down process from a previous crashed "
+            "torchrun launch -- launching onto a GPU already in that state is exactly what "
+            "produced rank-specific crashes before.\n"
+            "Fix: restart the Jupyter kernel (this releases any GPU memory this notebook process "
+            "itself is holding), then run `!nvidia-smi` again to confirm every GPU shows ~0 MiB "
+            "used. If memory is still stuck after a kernel restart, a process from a previous "
+            "crashed run is orphaned -- find its PID in `nvidia-smi`'s process list and kill it "
+            "(or restart the pod if it won't die)."
+        )
+    print(f"[launch_training] GPU pre-check OK: no GPU among the first {n_gpus} has more than "
+          f"{max_used_mib} MiB already in use.", flush=True)
 
 
 def launch_ddp_training(
@@ -44,6 +94,7 @@ def launch_ddp_training(
     hf_token: str = "",
 ) -> None:
     n_gpus = n_gpus or detect_gpu_count()
+    check_gpus_clean(n_gpus)
     worker_script = Path(__file__).resolve().parent / "train_worker.py"
     project_root = Path(__file__).resolve().parents[2]
 
